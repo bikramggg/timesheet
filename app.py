@@ -675,3 +675,46 @@ def worklog_plan_range(start: str, end: str, target_hours: float = 8.0,
         out.append(worklog_plan(d.isoformat(), target_hours, day_start))
         d += timedelta(days=1)
     return out
+
+
+import subprocess
+
+@app.post("/api/worklog/log")
+def worklog_run(date: str):
+    """Trigger the daily_worklog.sh script for a given date. Streams output to log."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "scripts", "log_worklog_playwright.py")
+    venv = os.path.join(here, ".venv", "bin", "python")
+    if not os.path.exists(script) or not os.path.exists(venv):
+        return {"status": "error", "error": "script or venv missing"}
+    log_path = os.path.join(here, "data", f"worklog-{date}.log")
+    env = os.environ.copy()
+    env["TIMESHEET_URL"] = env.get("TIMESHEET_URL", "http://localhost:8080")
+    try:
+        proc = subprocess.Popen(
+            [venv, script, date, "--mode=replay", "--headless"],
+            cwd=here, env=env,
+            stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
+        )
+        return {"status": "started", "pid": proc.pid, "log": f"/api/worklog/log_tail?date={date}"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/api/worklog/log_tail")
+def worklog_log_tail(date: str, lines: int = 200):
+    here = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(here, "data", f"worklog-{date}.log")
+    if not os.path.exists(log_path):
+        return {"date": date, "lines": [], "exists": False}
+    with open(log_path) as f:
+        all_lines = f.readlines()
+    return {"date": date, "exists": True, "lines": all_lines[-lines:],
+            "complete": any("[replay] done" in l for l in all_lines)}
+
+
+@app.get("/worklog", response_class=HTMLResponse)
+def worklog_page(request: Request, date: str = None):
+    if not date:
+        date = datetime.now(IST).date().isoformat()
+    return templates.TemplateResponse("worklog.html", {"request": request, "date": date})

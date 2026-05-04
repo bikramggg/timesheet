@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Worklog — {{ date }}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Worklog Plan <small><a href="/">← Timesheet</a> · <a href="/analytics">→ Analytics</a></small></h1>
+  <form method="get" id="filters" class="filters" onsubmit="event.preventDefault(); reload();">
+    <label>Date <input type="date" name="date" value="{{ date }}"></label>
+    <label>Target h <input type="number" name="target_hours" value="8" step="0.5" min="1" max="16" style="width:5rem"></label>
+    <button>Apply</button>
+  </form>
+</header>
+
+<section id="meta" class="totals">
+  <div class="card"><h3>Plan total</h3><span id="m-total">—</span></div>
+  <div class="card"><h3>Meetings</h3><span id="m-meet">—</span></div>
+  <div class="card"><h3>VSCode</h3><span id="m-vs">—</span></div>
+  <div class="card"><h3>AW active</h3><span id="m-aw">—</span></div>
+  <div class="card"><h3>Entries</h3><span id="m-count">—</span></div>
+  <div class="card"><h3>Default meeting</h3><span id="m-defmeet" style="font-size:1.1rem">—</span></div>
+</section>
+
+<section style="display:flex; gap:.5rem; margin-bottom:1rem; flex-wrap:wrap;">
+  <button class="btn" id="btn-log" onclick="logNow()">▶ Log this day to HnR</button>
+  <button class="btn" onclick="reload()">↻ Refresh plan</button>
+  <button class="btn" onclick="copyJson()">⧉ Copy JSON</button>
+  <span id="status" class="muted" style="align-self:center;"></span>
+</section>
+
+<section>
+  <h2 style="margin-top:0">Plan</h2>
+  <table>
+    <thead><tr>
+      <th>Time</th><th>Task</th><th>Min</th><th>Already</th><th>Source</th><th>Notes</th>
+    </tr></thead>
+    <tbody id="plan-tbody">
+      <tr><td colspan="6" class="muted">Loading…</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="log-section" class="card hidden" style="margin-top:1rem;">
+  <h3 style="margin-top:0">Run output</h3>
+  <pre id="log-pre" style="max-height: 360px; overflow:auto;"></pre>
+</section>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let currentPlan = null;
+
+async function loadPlan() {
+  const date = $('input[name=date]').value;
+  const target = $('input[name=target_hours]').value || 8;
+  const r = await fetch(`/api/worklog/plan?date=${date}&target_hours=${target}`);
+  const d = await r.json();
+  currentPlan = d;
+
+  $('#m-total').textContent = `${d.plan_total_hours}h`;
+  $('#m-meet').textContent = `${d.meeting_minutes}m`;
+  $('#m-vs').textContent = `${d.vscode_minutes_total}m`;
+  $('#m-aw').textContent = `${d.active_aw_minutes}m`;
+  $('#m-count').textContent = d.plan.length;
+  $('#m-defmeet').textContent = d.default_meeting_key || '—';
+
+  const tbody = $('#plan-tbody');
+  if (!d.plan.length) { tbody.innerHTML = '<tr><td colspan="6" class="muted">No entries</td></tr>'; return; }
+
+  tbody.innerHTML = d.plan.map(e => {
+    const already = e.already_logged_minutes || 0;
+    const willSkip = already >= e.minutes;
+    const cls = willSkip ? 'will-skip' : '';
+    const alreadyLabel = already ? `${already}m` : '—';
+    const taskLink = `https://${e.taskKey.startsWith('TUX') ? '' : ''}testlify.atlassian.net/browse/${e.taskKey}`;
+    return `<tr class="${cls}">
+      <td>${e.startTime}–${e.endTime}</td>
+      <td><a href="https://testlify.atlassian.net/browse/${e.taskKey}" target="_blank"><b>${e.taskKey}</b></a></td>
+      <td class="num">${e.minutes}m</td>
+      <td class="num">${alreadyLabel}</td>
+      <td><span class="src-${escapeHtml(e.source.replace(/\+/g,'_'))}">${escapeHtml(e.source.replace('_',' '))}</span></td>
+      <td>${escapeHtml(e.notes||'').slice(0,140)}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function logNow() {
+  const date = $('input[name=date]').value;
+  if (!confirm(`Submit ${currentPlan?.plan?.length||'?'} entries for ${date} to HnR? Already-logged ones will be skipped.`)) return;
+  $('#btn-log').disabled = true;
+  $('#status').textContent = 'Starting…';
+  $('#log-section').classList.remove('hidden');
+  $('#log-pre').textContent = '';
+
+  const r = await fetch(`/api/worklog/log?date=${date}`, {method: 'POST'});
+  const start = await r.json();
+  if (start.status !== 'started') {
+    $('#status').textContent = 'Error: ' + JSON.stringify(start);
+    $('#btn-log').disabled = false;
+    return;
+  }
+  $('#status').textContent = `Running (pid ${start.pid})…`;
+
+  // Poll log
+  const poll = setInterval(async () => {
+    const lr = await fetch(`/api/worklog/log_tail?date=${date}&lines=400`);
+    const ld = await lr.json();
+    $('#log-pre').textContent = ld.lines.join('');
+    $('#log-pre').scrollTop = $('#log-pre').scrollHeight;
+    if (ld.complete) {
+      clearInterval(poll);
+      $('#status').textContent = '✓ Done';
+      $('#btn-log').disabled = false;
+      // refresh plan to see new already_logged
+      setTimeout(loadPlan, 1000);
+    }
+  }, 2000);
+}
+
+function copyJson() {
+  if (!currentPlan) return;
+  navigator.clipboard.writeText(JSON.stringify(currentPlan.plan, null, 2));
+  $('#status').textContent = 'Copied JSON to clipboard';
+  setTimeout(() => $('#status').textContent = '', 2000);
+}
+
+function reload() { loadPlan(); }
+
+loadPlan();
+</script>
+</body>
+</html>

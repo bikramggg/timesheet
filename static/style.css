@@ -64,6 +64,15 @@ pre { background: var(--row); padding: 1rem; border-radius: 6px; white-space: pr
 .src-teams { color: #6cf; }
 .src-facetime { color: #f29e74; }
 .src-other { color: var(--muted); }
+.src-vscode_only { color: var(--accent); }
+.src-vscode_jira { color: #ffb454; }
+.src-jira_only { color: #6cf; }
+.src-calendar { color: #cda1ff; }
+tr.will-skip { opacity: 0.5; }
+tr.will-skip td { font-style: italic; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.hidden { display: none !important; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 h1 small { font-size: .9rem; font-weight: normal; }
 h1 small a { background: var(--row); padding: .3rem .8rem; border-radius: 4px; border: 1px solid var(--accent); }
