@@ -408,19 +408,47 @@ def _add_minutes(hhmm: str, minutes: int) -> str:
     return f"{(total // 60) % 24:02d}:{total % 60:02d}"
 
 
+DEFAULT_MEETING_KEY = os.environ.get("DEFAULT_MEETING_KEY", "TF-17894")
+
+
+def _parse_iso_time(iso_str: str) -> str:
+    """Extract HH:MM from an ISO datetime string."""
+    if not iso_str: return ""
+    if "T" in iso_str:
+        t = iso_str.split("T", 1)[1]
+        return t[:5]
+    return ""
+
+
+def _to_min(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+
+def _from_min(total: int) -> str:
+    return f"{(total // 60) % 24:02d}:{total % 60:02d}"
+
+
 @app.get("/api/worklog/plan")
 def worklog_plan(date: str, target_hours: float = 8.0, day_start: str = "10:00",
-                 jira_only_minutes: int = 10, skip_zero: bool = True):
+                 jira_only_minutes: int = 10, skip_zero: bool = True,
+                 default_meeting_key: str = None,
+                 dedupe_overlap_pct: float = 0.5):
     """
     Plan worklog entries for one day. Output shape matches HnR Forge app's createEntry payload:
         {taskKey, minutes, notes, entryDate, startTime, endTime}
 
-    Allocation:
-      1. VSCode branches matching an issue key (e.g. TF-1234) → minutes proportional to coded time
-      2. Jira-touched issues with no VSCode time → flat `jira_only_minutes` each
-      3. Total scaled so coding time fills (target_hours - meeting_minutes)
-      4. Sequential time slots starting at `day_start`, no overlap
+    Three entry sources:
+      1. **Calendar meetings + detected sessions** (Slack huddles, ad-hoc Meet/Zoom):
+         taskKey = TF-xxxx parsed from title, fallback to `default_meeting_key`.
+         Uses actual start/end times. Detected sessions take priority on overlap.
+      2. **VSCode coding** matched to issue keys: minutes proportional to coded time.
+      3. **Jira-touched issues with no VSCode time**: flat `jira_only_minutes` each.
+
+    Coding pool = target_hours - sum(meeting_minutes). Coding entries scheduled
+    sequentially starting `day_start`, jumping over meeting time-windows.
     """
+    default_meeting_key = default_meeting_key or DEFAULT_MEETING_KEY
     with conn() as c:
         # VSCode minutes per branch
         vs_rows = c.execute(
@@ -464,9 +492,68 @@ def worklog_plan(date: str, target_hours: float = 8.0, day_start: str = "10:00",
         aw_row = c.execute("SELECT active_seconds FROM activitywatch_daily WHERE date=?", (date,)).fetchone()
         aw_min = round((aw_row[0] or 0) / 60) if aw_row else 0
 
-        meet_min = round(c.execute(
-            "SELECT COALESCE(SUM(duration_seconds),0)/60.0 FROM meeting_sessions WHERE date=?", (date,)
-        ).fetchone()[0])
+        # Detected meeting sessions (Slack huddle, ad-hoc Meet, etc.)
+        sessions = [dict(r) for r in c.execute(
+            "SELECT source, title, start_time, end_time, duration_seconds FROM meeting_sessions WHERE date=? ORDER BY start_time",
+            (date,)
+        ).fetchall()]
+
+        # Scheduled calendar events
+        cal_events = [dict(r) for r in c.execute(
+            "SELECT summary, start_time, end_time, duration_minutes FROM calendar_events WHERE date=? ORDER BY start_time",
+            (date,)
+        ).fetchall()]
+
+    # Build meeting entries — sessions first (real attendance), then non-overlapping calendar events
+    meet_entries = []
+
+    def make_meeting_entry(title, start_iso, end_iso, minutes, src_label):
+        m = ISSUE_RE.search(title or "")
+        key = m.group(1) if m else default_meeting_key
+        st = _parse_iso_time(start_iso) or day_start
+        et = _parse_iso_time(end_iso) or _from_min(_to_min(st) + minutes)
+        return {
+            "taskKey": key,
+            "minutes": int(minutes),
+            "notes": f"{src_label}: {title}" if title else src_label,
+            "entryDate": date,
+            "startTime": st,
+            "endTime": et,
+            "summary": title or "",
+            "source": src_label,
+            "_matched_default": m is None,
+        }
+
+    for s in sessions:
+        mins = round((s["duration_seconds"] or 0) / 60)
+        if mins < 1: continue
+        meet_entries.append(make_meeting_entry(s["title"], s["start_time"], s["end_time"], mins,
+                                               s["source"]))  # slack_huddle | google_meet | zoom | teams | facetime
+
+    # Add calendar events that don't overlap a detected session by >dedupe_overlap_pct of their duration
+    def overlap_minutes(a_start, a_end, b_start, b_end):
+        return max(0, min(a_end, b_end) - max(a_start, b_start))
+
+    for ev in cal_events:
+        mins = ev["duration_minutes"] or 0
+        if mins < 1: continue
+        st_iso = ev["start_time"]; en_iso = ev["end_time"]
+        st = _parse_iso_time(st_iso); en = _parse_iso_time(en_iso)
+        if not st or not en: continue
+        a1, a2 = _to_min(st), _to_min(en)
+        # check overlap with any detected session
+        overlapped = False
+        for s in sessions:
+            ss = _parse_iso_time(s["start_time"]); se = _parse_iso_time(s["end_time"])
+            if not ss or not se: continue
+            b1, b2 = _to_min(ss), _to_min(se)
+            if (a2 - a1) > 0 and overlap_minutes(a1, a2, b1, b2) / max(1, a2 - a1) > dedupe_overlap_pct:
+                overlapped = True; break
+        if overlapped: continue
+        meet_entries.append(make_meeting_entry(ev["summary"], st_iso, en_iso, mins, "calendar"))
+
+    meet_entries.sort(key=lambda x: _to_min(x["startTime"]))
+    meet_min = sum(e["minutes"] for e in meet_entries)
 
     # Allocation
     target_min = int(round(target_hours * 60))
@@ -517,31 +604,45 @@ def worklog_plan(date: str, target_hours: float = 8.0, day_start: str = "10:00",
                 "_vscode_minutes": 0,
             })
 
-    # Sort by largest first so big slots come early in day
+    # Sort coding entries by largest first
     raw_entries.sort(key=lambda x: -x["minutes"])
 
-    # Sequential time slots starting at day_start
-    cursor = day_start
-    plan = []
+    # Schedule coding entries in gaps between meetings, starting day_start
+    busy = sorted([(_to_min(m["startTime"]), _to_min(m["endTime"])) for m in meet_entries])
+    cursor = _to_min(day_start)
+    coding_plan = []
+
+    def next_free_slot(c, length):
+        c = max(c, _to_min(day_start))
+        for s, e in busy:
+            if c + length <= s: return c
+            if c < e: c = e
+        return c
+
     for e in raw_entries:
         if skip_zero and e["minutes"] < 1:
             continue
-        start = cursor
-        end = _add_minutes(start, e["minutes"])
-        plan.append({
+        start = next_free_slot(cursor, e["minutes"])
+        end = start + e["minutes"]
+        coding_plan.append({
             "taskKey": e["taskKey"],
             "minutes": e["minutes"],
             "notes": e["notes"],
             "entryDate": e["entryDate"],
-            "startTime": start,
-            "endTime": end,
-            # extra context for the UI/automation
+            "startTime": _from_min(start),
+            "endTime": _from_min(end),
             "summary": e["_summary"],
             "source": e["_source"],
             "already_logged_minutes": e["_already_logged_minutes"],
             "vscode_minutes": e["_vscode_minutes"],
         })
         cursor = end
+
+    # Combine + final sort by start time
+    plan = sorted(meet_entries + coding_plan, key=lambda x: _to_min(x["startTime"]))
+    # Strip internal flags
+    for e in plan:
+        e.pop("_matched_default", None)
 
     return {
         "date": date,
@@ -551,6 +652,7 @@ def worklog_plan(date: str, target_hours: float = 8.0, day_start: str = "10:00",
         "vscode_minutes_total": round(total_vs),
         "vscode_unmatched_minutes": round(vs_unmatched),
         "jira_only_issue_count": len(jira_only_keys),
+        "default_meeting_key": default_meeting_key,
         "plan": plan,
         "plan_total_minutes": sum(p["minutes"] for p in plan),
         "plan_total_hours": round(sum(p["minutes"] for p in plan) / 60, 2),

@@ -25,6 +25,7 @@ HNR_PATH = os.environ.get(
     "/jira/apps/450c899a-1fd9-417d-8934-8898c123f3ab/1baa3c54-c998-4854-b9c6-b38d1007a73c",
 )
 STATE_FILE = Path(__file__).parent / ".playwright_state.json"
+TEMPLATE_FILE = Path(__file__).parent / ".hnr_template.json"
 
 
 async def fetch_plan(date_str: str, target_hours: float = 8.0):
@@ -35,78 +36,196 @@ async def fetch_plan(date_str: str, target_hours: float = 8.0):
         return r.json()
 
 
-async def replay_mode(plan, headless=False):
-    """Capture one real submit, extract the GraphQL endpoint + contextToken, replay for remaining entries."""
+async def _capture_template(plan, headless=False):
+    """Open browser, wait for user to submit ONE entry by hand to capture template.
+    Saves snapshot synchronously when the request fires, so closing the browser doesn't lose data."""
     from playwright.async_api import async_playwright
     captured = {}
-
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
         ctx = await browser.new_context(storage_state=str(STATE_FILE) if STATE_FILE.exists() else None)
         page = await ctx.new_page()
 
-        async def on_req(req):
+        def on_req_sync(req):
             url = req.url
-            if "/gateway/api/graphql/pq/" in url and "useInvokeExtensionRelayMutation" in (url + (req.post_data or "")):
-                if not req.post_data: return
-                try:
-                    body = json.loads(req.post_data)
-                except Exception:
-                    return
-                payload = body.get("variables", {}).get("input", {}).get("payload", {})
-                call = payload.get("call", {})
-                if call.get("functionKey") == "createEntry":
-                    captured["url"] = url
-                    captured["body_template"] = body  # we'll mutate the inner taskKey/minutes/etc
-                    captured["headers"] = await req.all_headers()
-                    captured["cookies"] = await ctx.cookies()
-                    print("[replay] captured live createEntry request")
+            if "/gateway/api/graphql/pq/" not in url: return
+            pd = req.post_data
+            if not pd or "useInvokeExtensionRelayMutation" not in pd: return
+            try: body = json.loads(pd)
+            except Exception: return
+            payload = body.get("variables", {}).get("input", {}).get("payload", {})
+            if payload.get("call", {}).get("functionKey") != "createEntry": return
+            # Use SYNC headers dict — available immediately, no await needed
+            try:
+                hdrs = dict(req.headers)
+            except Exception:
+                hdrs = {}
+            captured["url"] = url
+            captured["body_template"] = body
+            captured["headers"] = hdrs
+            print("[capture] got live createEntry request")
 
-        page.on("request", on_req)
+        page.on("request", on_req_sync)
         await page.goto(JIRA_BASE + HNR_PATH)
-        print("[replay] log in if needed, then submit ONE worklog entry by hand. Waiting 5 minutes.")
-        # Wait until we see the request
+        print("[capture] log in if needed, then submit ONE worklog entry by hand. Waiting 5 min...")
         for _ in range(60):
             if "url" in captured: break
             await asyncio.sleep(5)
-        if "url" not in captured:
-            print("Timed out waiting for a sample createEntry submission. Aborting.")
+        # Snapshot cookies + state while browser still alive
+        if "url" in captured:
+            try:
+                captured["cookies"] = await ctx.cookies()
+            except Exception:
+                captured["cookies"] = []
+        try:
             await ctx.storage_state(path=str(STATE_FILE))
+        except Exception:
+            pass
+        try:
             await browser.close()
+        except Exception:
+            pass
+
+    if "url" not in captured:
+        return None
+
+    hdrs = captured.get("headers", {})
+    template = {
+        "url": captured["url"],
+        "body_template": captured["body_template"],
+        "atl_attribution": hdrs.get("atl-attribution", ""),
+        "atl_client_name": hdrs.get("atl-client-name", "atlassian-frontend-monorepo"),
+        "x_experimentalapi": hdrs.get("x-experimentalapi", ""),
+        "user_agent": hdrs.get("user-agent", "Mozilla/5.0"),
+        "cookies": captured.get("cookies", []),
+    }
+    TEMPLATE_FILE.write_text(json.dumps(template, indent=2))
+    print(f"[capture] template saved to {TEMPLATE_FILE}")
+    return template
+
+
+async def _refresh_context_token(headless=True):
+    """Open page (headless OK), wait for any Forge GraphQL request, return fresh contextToken + cookies."""
+    from playwright.async_api import async_playwright
+    fresh = {}
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=headless)
+        ctx = await browser.new_context(storage_state=str(STATE_FILE) if STATE_FILE.exists() else None)
+        page = await ctx.new_page()
+
+        def on_req_sync(req):
+            if "/gateway/api/graphql/pq/" not in req.url: return
+            pd = req.post_data
+            if not pd: return
+            try: body = json.loads(pd)
+            except: return
+            payload = body.get("variables", {}).get("input", {}).get("payload", {})
+            ctx_tok = payload.get("contextToken")
+            if ctx_tok and "contextToken" not in fresh:
+                fresh["contextToken"] = ctx_tok
+                fresh["context"] = payload.get("context", {})
+                fresh["contextIds"] = body.get("variables", {}).get("input", {}).get("contextIds", [])
+                fresh["extensionId"] = body.get("variables", {}).get("input", {}).get("extensionId", "")
+
+        page.on("request", on_req_sync)
+        try:
+            await page.goto(JIRA_BASE + HNR_PATH, timeout=60000)
+        except Exception as e:
+            print(f"[refresh] navigate warning: {e}")
+        # Wait up to 30s
+        for _ in range(30):
+            if "contextToken" in fresh: break
+            await asyncio.sleep(1)
+        cookies = []
+        try:
+            cookies = await ctx.cookies()
+        except Exception: pass
+        try:
+            await ctx.storage_state(path=str(STATE_FILE))
+        except Exception: pass
+        try:
+            await browser.close()
+        except Exception: pass
+
+    fresh["cookies"] = cookies
+    return fresh if "contextToken" in fresh else None
+
+
+async def replay_mode(plan, headless=False):
+    """
+    First run (no template cached): user logs in + submits 1 entry by hand to capture template.
+    Subsequent runs: headless, fetches fresh contextToken, replays all entries directly.
+    """
+    if not TEMPLATE_FILE.exists():
+        print("[replay] no template cached. Capturing now (one-time setup).")
+        template = await _capture_template(plan, headless=False)
+        if not template:
+            print("[replay] capture failed/timed out. Aborting.")
             return
+        # Replay remaining entries (skip first, which was submitted manually)
+        plan_to_send = plan[1:]
+        print(f"[replay] replaying {len(plan_to_send)} remaining entries from captured template")
+    else:
+        template = json.loads(TEMPLATE_FILE.read_text())
+        print("[replay] using cached template; refreshing contextToken headlessly")
+        fresh = await _refresh_context_token(headless=True)
+        if not fresh:
+            print("[replay] could not get fresh contextToken (session expired?). Re-run with --recapture to redo login.")
+            return
+        # Inject fresh tokens into template
+        body = json.loads(json.dumps(template["body_template"]))
+        body["variables"]["input"]["contextIds"] = fresh["contextIds"] or body["variables"]["input"]["contextIds"]
+        body["variables"]["input"]["extensionId"] = fresh["extensionId"] or body["variables"]["input"]["extensionId"]
+        body["variables"]["input"]["payload"]["context"] = fresh["context"] or body["variables"]["input"]["payload"]["context"]
+        body["variables"]["input"]["payload"]["contextToken"] = fresh["contextToken"]
+        template["body_template"] = body
+        template["cookies"] = fresh["cookies"]
+        plan_to_send = plan
 
-        await ctx.storage_state(path=str(STATE_FILE))
+    cookies = template.get("cookies") or []
+    cookie_dict = {c["name"]: c["value"] for c in cookies
+                   if c["domain"].endswith("atlassian.net") or c["domain"].endswith("atlassian.com")}
 
-        # Replay
-        async with httpx.AsyncClient(
-            timeout=30,
-            cookies={c["name"]: c["value"] for c in captured["cookies"] if c["domain"].endswith("atlassian.net") or c["domain"].endswith("atlassian.com")},
-            headers={
-                "content-type": "application/json",
-                "origin": JIRA_BASE,
-                "referer": JIRA_BASE + HNR_PATH,
-                "user-agent": captured["headers"].get("user-agent", "Mozilla/5.0"),
-                "atl-attribution": captured["headers"].get("atl-attribution", ""),
-                "atl-client-name": captured["headers"].get("atl-client-name", "atlassian-frontend-monorepo"),
-                "x-experimentalapi": captured["headers"].get("x-experimentalapi", ""),
-                "x-request-fallback-to-post-reason": "mutation",
-            },
-        ) as cli:
-            for e in plan:
-                body = json.loads(json.dumps(captured["body_template"]))
-                body["variables"]["input"]["payload"]["call"]["payload"] = {
-                    "taskKey": e["taskKey"],
-                    "minutes": int(e["minutes"]),
-                    "notes": e["notes"],
-                    "entryDate": e["entryDate"],
-                    "startTime": e["startTime"],
-                    "endTime": e["endTime"],
-                }
-                r = await cli.post(captured["url"], json=body)
-                ok = r.status_code == 200 and "errors" not in r.text
-                print(f"  {e['taskKey']:<12} {e['minutes']}m  -> {r.status_code}  {'OK' if ok else r.text[:120]}")
-
-        await browser.close()
+    async with httpx.AsyncClient(
+        timeout=30,
+        cookies=cookie_dict,
+        headers={
+            "content-type": "application/json",
+            "origin": JIRA_BASE,
+            "referer": JIRA_BASE + HNR_PATH,
+            "user-agent": template["user_agent"],
+            "atl-attribution": template["atl_attribution"],
+            "atl-client-name": template["atl_client_name"],
+            "x-experimentalapi": template["x_experimentalapi"],
+            "x-request-fallback-to-post-reason": "mutation",
+            "accept": "application/graphql-response+json, application/json",
+        },
+    ) as cli:
+        ok_count = fail_count = 0
+        for e in plan_to_send:
+            body = json.loads(json.dumps(template["body_template"]))
+            body["variables"]["input"]["payload"]["call"]["payload"] = {
+                "taskKey": e["taskKey"],
+                "minutes": int(e["minutes"]),
+                "notes": e["notes"],
+                "entryDate": e["entryDate"],
+                "startTime": e["startTime"],
+                "endTime": e["endTime"],
+            }
+            r = await cli.post(template["url"], json=body)
+            ok = False; reason = ""
+            try:
+                resp = r.json()
+                errs = resp.get("errors")
+                if r.status_code == 200 and not errs:
+                    ok = True
+                else:
+                    reason = json.dumps(errs)[:140] if errs else f"HTTP {r.status_code}"
+            except Exception:
+                reason = r.text[:140]
+            ok_count += int(ok); fail_count += int(not ok)
+            print(f"  {e['taskKey']:<12} {e['minutes']:>4}m {e['startTime']}-{e['endTime']}  -> {r.status_code}  {'OK' if ok else 'FAIL: '+reason}")
+        print(f"[replay] done: {ok_count} OK, {fail_count} FAIL")
 
 
 async def ui_mode(plan, headless=False):
@@ -161,13 +280,18 @@ async def ui_mode(plan, headless=False):
 async def main():
     args = sys.argv[1:]
     if not args:
-        print("Usage: log_worklog_playwright.py YYYY-MM-DD [--mode=ui|replay] [--target=8] [--headless] [--dry-run]")
+        print("Usage: log_worklog_playwright.py YYYY-MM-DD [--mode=ui|replay] [--target=8] [--headless] [--dry-run] [--recapture]")
         sys.exit(1)
     date_str = args[0]
-    mode = next((a.split("=",1)[1] for a in args if a.startswith("--mode=")), "ui")
+    mode = next((a.split("=",1)[1] for a in args if a.startswith("--mode=")), "replay")
     target = float(next((a.split("=",1)[1] for a in args if a.startswith("--target=")), 8.0))
     headless = "--headless" in args
     dry = "--dry-run" in args
+    recapture = "--recapture" in args
+
+    if recapture and TEMPLATE_FILE.exists():
+        TEMPLATE_FILE.unlink()
+        print(f"[setup] removed cached template at {TEMPLATE_FILE}")
 
     plan_resp = await fetch_plan(date_str, target)
     plan = plan_resp["plan"]

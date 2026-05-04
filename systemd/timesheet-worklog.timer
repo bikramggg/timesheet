@@ -1,0 +1,10 @@
+[Unit]
+Description=Run timesheet auto-worklog daily at 23:00 IST
+
+[Timer]
+OnCalendar=*-*-* 17:30:00 UTC
+Persistent=true
+Unit=timesheet-worklog.service
+
+[Install]
+WantedBy=timers.target

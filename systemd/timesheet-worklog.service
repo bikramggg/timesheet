@@ -1,0 +1,14 @@
+[Unit]
+Description=Timesheet daily auto-worklog (HnR via Playwright)
+After=network-online.target timesheet-web.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bikramghosh
+WorkingDirectory=/home/bikramghosh/timesheet
+EnvironmentFile=/home/bikramghosh/timesheet/.env
+ExecStart=/home/bikramghosh/timesheet/scripts/daily_worklog.sh
+StandardOutput=append:/home/bikramghosh/timesheet/data/daily-worklog.log
+StandardError=append:/home/bikramghosh/timesheet/data/daily-worklog.log
+TimeoutStartSec=600
