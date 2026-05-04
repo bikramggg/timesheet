@@ -186,6 +186,10 @@ document.querySelectorAll('.row-day').forEach(tr => {
   tr.addEventListener('click', () => openDay(tr.dataset.date));
 });
 
+// Deep link: ?openDay=YYYY-MM-DD auto-opens that day's modal
+const _qsOpen = new URLSearchParams(location.search).get('openDay');
+if (_qsOpen) openDay(_qsOpen);
+
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 $('#modal').addEventListener('click', e => { if (e.target === $('#modal')) closeModal(); });
 

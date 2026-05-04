@@ -4,6 +4,10 @@ Self-hosted developer activity dashboard. Pulls signals from your dev workflow i
 
 Designed to run on a Raspberry Pi for nightly aggregation, with a sync agent on your Mac/Linux laptop.
 
+![Dashboard](docs/screenshots/01-dashboard.png)
+
+
+
 ## Sources
 
 | Source | What it captures | Where |
@@ -22,6 +26,23 @@ Designed to run on a Raspberry Pi for nightly aggregation, with a sync agent on 
 - **ntfy push notifications** on every collector run + every laptop sync
 - **systemd timer** on the server, **launchd** on the laptop — fully unattended
 - **Optional `pmset` wake schedule** to keep nightly sync working with lid closed
+
+## Screenshots
+
+### Day modal (click a row)
+Tree-pivoted Jira (by issue) and VSCode (by branch). Detected meetings (Slack huddles, ad-hoc Meet) inline with scheduled calendar. Deep-linkable via `?openDay=YYYY-MM-DD`.
+
+![Day modal](docs/screenshots/04-day-modal.png)
+
+### Day detail page
+Same data as the modal, but a permanent URL (`/day/YYYY-MM-DD`).
+
+![Day detail](docs/screenshots/02-day-detail.png)
+
+### Analytics
+Most-productive weekday, language donut, top projects, time summary, weekly/monthly trends, GitHub-style activity heatmap, project + language distribution.
+
+![Analytics](docs/screenshots/03-analytics.png)
 
 ## Architecture
 
