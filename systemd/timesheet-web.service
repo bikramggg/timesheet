@@ -1,0 +1,17 @@
+[Unit]
+Description=Timesheet dashboard web server
+After=network-online.target
+
+[Service]
+Type=simple
+User=timesheet
+WorkingDirectory=/opt/timesheet
+EnvironmentFile=/opt/timesheet/.env
+ExecStart=/opt/timesheet/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/opt/timesheet/data/web.log
+StandardError=append:/opt/timesheet/data/web.log
+
+[Install]
+WantedBy=multi-user.target

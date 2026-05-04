@@ -1,0 +1,13 @@
+[Unit]
+Description=Timesheet daily collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=timesheet
+WorkingDirectory=/opt/timesheet
+EnvironmentFile=/opt/timesheet/.env
+ExecStart=/opt/timesheet/.venv/bin/python -m collectors.run_all
+StandardOutput=append:/opt/timesheet/data/collect.log
+StandardError=append:/opt/timesheet/data/collect.log

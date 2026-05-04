@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ d }}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>{{ d }} <small><a href="/">← back</a> · <a href="/analytics">→ Analytics</a></small></h1>
+</header>
+
+{% if detail.summary %}
+<section class="summary">
+  <h2>AI Summary <small>{{ detail.summary.generated_at }}</small></h2>
+  <pre>{{ detail.summary.summary_md }}</pre>
+</section>
+{% endif %}
+
+<section>
+  <h2>ActivityWatch</h2>
+  {% if detail.activitywatch %}
+  <p>Active <b>{{ '%.2f'|format(detail.activitywatch.active_seconds/3600) }}h</b> ·
+     Window <b>{{ '%.2f'|format(detail.activitywatch.window_seconds/3600) }}h</b> ·
+     AFK <b>{{ '%.2f'|format(detail.activitywatch.afk_seconds/3600) }}h</b></p>
+  {% else %}<p class="muted">—</p>{% endif %}
+</section>
+
+<section>
+  {% set vs_total = (detail.vscode | sum(attribute='minutes')) %}
+  <h2>VSCode ({{ '%.2f'|format(vs_total/60) }}h, {{ vscode_tree|length }} branches)</h2>
+  <table class="m-tree">
+    <thead><tr><th>Branch</th><th>Project</th><th>Language</th><th>Min</th></tr></thead>
+    <tbody>
+    {% for grp in vscode_tree %}
+      <tr class="t-parent">
+        <td><b>{{ grp.branch }}</b></td>
+        <td class="muted">{{ grp.children|length }} entries</td>
+        <td></td>
+        <td class="num"><b>{{ '%.1f'|format(grp.total) }}</b></td>
+      </tr>
+      {% for r in grp.children %}
+      <tr class="t-child">
+        <td></td>
+        <td class="t-indent">↳ {{ r.project }}</td>
+        <td>{{ r.language }}</td>
+        <td class="num">{{ r.minutes }}</td>
+      </tr>
+      {% endfor %}
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Jira ({{ jira_tree|length }} issues, {{ detail.jira|length }} actions)</h2>
+  <table class="m-tree">
+    <thead><tr><th>Key</th><th>Summary / Action</th><th>Status / Detail</th><th>#</th></tr></thead>
+    <tbody>
+    {% for issue in jira_tree %}
+      <tr class="t-parent">
+        <td><a href="{{ jira_base }}/browse/{{ issue.key }}" target="_blank"><b>{{ issue.key }}</b></a></td>
+        <td>{{ issue.summary }}</td>
+        <td>{{ issue.status }}</td>
+        <td class="num">{{ issue.actions|length }}</td>
+      </tr>
+      {% for a in issue.actions %}
+      <tr class="t-child">
+        <td></td>
+        <td class="t-indent">↳ <span class="action-{{ a.action.split(':')[0] }}">{{ a.action }}</span></td>
+        <td colspan="2" class="muted">{{ a.detail or '' }}</td>
+      </tr>
+      {% endfor %}
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% if detail.meetings %}
+<section>
+  {% set total_sec = (detail.meetings | sum(attribute='duration_seconds')) %}
+  <h2>Detected Meetings ({{ detail.meetings|length }}, {{ '%.2f'|format(total_sec/3600) }}h)</h2>
+  <p class="muted">
+  {% for src, v in meet_summary.items() %}
+    <span class="src-{{ src }}">{{ src.replace('_',' ') }}</span>: {{ v.count }}× / {{ '%d'|format(v.seconds/60) }}m{% if not loop.last %} · {% endif %}
+  {% endfor %}
+  </p>
+  <table>
+    <thead><tr><th>Time</th><th>Dur</th><th>Source</th><th>Title</th></tr></thead>
+    <tbody>
+    {% for r in detail.meetings %}
+    <tr>
+      <td>{{ r.start_time.split('T')[1][:5] if 'T' in (r.start_time or '') else '' }}</td>
+      <td>{{ '%d'|format(r.duration_seconds/60) }}m</td>
+      <td><span class="src-{{ r.source }}">{{ r.source.replace('_',' ') }}</span></td>
+      <td>{{ r.title }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<section>
+  <h2>GitHub</h2>
+  <table>
+    <thead><tr><th>Repo</th><th>PR</th><th>Title</th><th>Event</th></tr></thead>
+    <tbody>
+    {% for r in detail.github %}
+    <tr>
+      <td>{{ r.repo }}</td>
+      <td><a href="{{ r.url }}" target="_blank">#{{ r.pr_number }}</a></td>
+      <td>{{ r.title }}</td>
+      <td><span class="event-{{ r.event }}">{{ r.event }}</span></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  {% set cal_min = (detail.calendar | sum(attribute='duration_minutes')) %}
+  <h2>Calendar ({{ detail.calendar|length }} events, {{ '%.2f'|format((cal_min or 0)/60) }}h)</h2>
+  <table>
+    <thead><tr><th>Time</th><th>Dur</th><th>Summary</th><th>Meet</th></tr></thead>
+    <tbody>
+    {% for r in detail.calendar %}
+    <tr>
+      <td>{{ r.start_time.split('T')[1][:5] if 'T' in (r.start_time or '') else '' }}</td>
+      <td>{{ r.duration_minutes }}m</td>
+      <td>{{ r.summary }}</td>
+      <td>{{ '✓' if r.is_meet else '' }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+</body>
+</html>

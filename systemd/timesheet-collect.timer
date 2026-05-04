@@ -1,0 +1,10 @@
+[Unit]
+Description=Run timesheet collector daily at 23:55 IST
+
+[Timer]
+OnCalendar=*-*-* 18:25:00 UTC
+Persistent=true
+Unit=timesheet-collect.service
+
+[Install]
+WantedBy=timers.target

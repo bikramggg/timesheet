@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Timesheet</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Timesheet <small><a href="/analytics">→ Analytics</a></small></h1>
+  <form method="get" class="range">
+    <label>From <input type="date" name="start" value="{{ start }}"></label>
+    <label>To <input type="date" name="end" value="{{ end }}"></label>
+    <button>Apply</button>
+    <button type="button" onclick="trigger()">Run now</button>
+  </form>
+</header>
+
+<section class="totals">
+  <div class="card"><h3>VSCode</h3><span>{{ totals.vscode_hours }}h</span></div>
+  <div class="card"><h3>Active (AW)</h3><span>{{ totals.aw_active_hours }}h</span></div>
+  <div class="card"><h3>Meetings</h3><span>{{ totals.meeting_hours }}h</span></div>
+  <div class="card"><h3>Jira actions</h3><span>{{ totals.jira_actions }}</span></div>
+  <div class="card"><h3>PRs opened</h3><span>{{ totals.prs_opened }}</span></div>
+  <div class="card"><h3>PRs merged</h3><span>{{ totals.prs_merged }}</span></div>
+</section>
+
+<table class="grid">
+  <thead><tr>
+    <th>Date</th><th>Day</th>
+    <th>VSCode (h)</th><th>AW Active (h)</th><th>Meet (h)</th>
+    <th>Jira issues</th><th>Jira actions</th><th>PRs opened</th><th>PRs merged</th>
+  </tr></thead>
+  <tbody>
+  {% for r in rows %}
+  <tr class="row-day {% if r.is_weekend %}weekend{% endif %}" data-date="{{ r.date }}">
+    <td>{{ r.date }}</td>
+    <td>{{ r.weekday }}{% if r.holiday %} ({{ r.holiday }}){% endif %}</td>
+    <td>{{ '%.2f'|format((r.vscode_minutes or 0)/60) }}</td>
+    <td>{{ r.aw_active_hours or 0 }}</td>
+    <td>{{ r.meeting_hours or 0 }}</td>
+    <td>{{ r.jira_issues or 0 }}</td>
+    <td>{{ r.jira_actions or 0 }}</td>
+    <td>{{ r.gh_prs_opened or 0 }}</td>
+    <td>{{ r.gh_prs_merged or 0 }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-box">
+    <header class="modal-header">
+      <h2 id="modal-title">Loading…</h2>
+      <div class="modal-actions">
+        <a id="modal-full" href="#" class="btn">View full page →</a>
+        <button class="btn btn-close" onclick="closeModal()" aria-label="Close">×</button>
+      </div>
+    </header>
+    <div id="modal-body" class="modal-body">…</div>
+  </div>
+</div>
+
+<script>
+const jiraBase = "{{ jira_base }}";
+const $ = (s, r=document) => r.querySelector(s);
+const escapeHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function fmtSec(s){ return s ? (s/3600).toFixed(2)+'h' : '0h'; }
+
+async function openDay(date){
+  $('#modal').classList.remove('hidden');
+  $('#modal-title').textContent = date;
+  $('#modal-full').href = `/day/${date}`;
+  $('#modal-body').innerHTML = '<p class="muted">Loading…</p>';
+  const r = await fetch(`/api/day/${date}`);
+  const d = await r.json();
+  renderModal(d);
+}
+
+function closeModal(){ $('#modal').classList.add('hidden'); }
+
+function section(title, html){
+  return `<section class="m-section"><h3>${escapeHtml(title)}</h3>${html}</section>`;
+}
+
+function renderModal(d){
+  let html = '';
+
+  // Activity Watch
+  if (d.activitywatch) {
+    const a = d.activitywatch;
+    html += section('ActivityWatch',
+      `<p>Active <b>${fmtSec(a.active_seconds)}</b> · Window <b>${fmtSec(a.window_seconds)}</b> · AFK <b>${fmtSec(a.afk_seconds)}</b></p>`);
+  }
+
+  // VSCode — tree pivoted on branch
+  if (d.vscode?.length) {
+    const total = d.vscode.reduce((s,r)=>s+(r.minutes||0),0);
+    const byBranch = {};
+    d.vscode.forEach(r => {
+      const k = r.branch || '(none)';
+      (byBranch[k] = byBranch[k] || {total: 0, children: []}).total += r.minutes || 0;
+      byBranch[k].children.push(r);
+    });
+    const branchKeys = Object.keys(byBranch).sort((a,b) => byBranch[b].total - byBranch[a].total);
+    const tree = branchKeys.map(b => {
+      const grp = byBranch[b];
+      const kids = grp.children.sort((a,b)=>b.minutes-a.minutes).map(r =>
+        `<tr class="t-child"><td></td><td class="t-indent">↳ ${escapeHtml(r.project)}</td><td>${escapeHtml(r.language)}</td><td class="num">${r.minutes}</td></tr>`
+      ).join('');
+      return `<tr class="t-parent"><td><b>${escapeHtml(b)}</b></td><td class="muted">${grp.children.length} entries</td><td></td><td class="num"><b>${grp.total.toFixed(1)}</b></td></tr>${kids}`;
+    }).join('');
+    html += section(`VSCode (${(total/60).toFixed(2)}h, ${branchKeys.length} branches)`,
+      `<table class="m-tbl m-tree"><thead><tr><th>Branch</th><th>Project</th><th>Language</th><th>Min</th></tr></thead><tbody>${tree}</tbody></table>`);
+  }
+
+  // Jira — tree grouped by issue key, action rows nested
+  if (d.jira?.length) {
+    const byKey = {};
+    d.jira.forEach(r => {
+      const k = r.issue_key;
+      if (!byKey[k]) byKey[k] = {key: k, summary: r.summary, status: r.status, project: r.project, actions: []};
+      byKey[k].actions.push({action: r.action, detail: r.detail});
+    });
+    const keys = Object.keys(byKey);
+    const tree = keys.map(k => {
+      const issue = byKey[k];
+      const link = `${jiraBase}/browse/${encodeURIComponent(k)}`;
+      const actions = issue.actions.map(a => {
+        const ac = a.action.split(':')[0];
+        return `<tr class="t-child"><td></td><td class="t-indent">↳ <span class="action-${escapeHtml(ac)}">${escapeHtml(a.action)}</span></td><td colspan="2" class="muted">${escapeHtml(a.detail||'')}</td></tr>`;
+      }).join('');
+      return `<tr class="t-parent"><td><a href="${link}" target="_blank"><b>${escapeHtml(k)}</b></a></td><td>${escapeHtml(issue.summary)}</td><td>${escapeHtml(issue.status)}</td><td class="num">${issue.actions.length}</td></tr>${actions}`;
+    }).join('');
+    html += section(`Jira (${keys.length} issues, ${d.jira.length} actions)`,
+      `<table class="m-tbl m-tree"><thead><tr><th>Key</th><th>Summary / Action</th><th>Status / Detail</th><th>#</th></tr></thead><tbody>${tree}</tbody></table>`);
+  }
+
+  // GitHub
+  if (d.github?.length) {
+    const rows = d.github.map(r =>
+      `<tr><td>${escapeHtml(r.repo)}</td><td><a href="${escapeHtml(r.url)}" target="_blank">#${r.pr_number}</a></td><td>${escapeHtml(r.title)}</td><td><span class="event-${escapeHtml(r.event)}">${escapeHtml(r.event)}</span></td></tr>`
+    ).join('');
+    html += section(`GitHub (${d.github.length})`,
+      `<table class="m-tbl"><thead><tr><th>Repo</th><th>PR</th><th>Title</th><th>Event</th></tr></thead><tbody>${rows}</tbody></table>`);
+  }
+
+  // Detected meetings (from AW: huddles, ad-hoc Meet/Zoom/Teams)
+  if (d.meetings?.length) {
+    const totalSec = d.meetings.reduce((s,r)=>s+(r.duration_seconds||0),0);
+    const bySource = {};
+    d.meetings.forEach(r => {
+      bySource[r.source] = (bySource[r.source]||{count:0, sec:0});
+      bySource[r.source].count++;
+      bySource[r.source].sec += r.duration_seconds||0;
+    });
+    const summary = Object.entries(bySource).map(([k,v]) =>
+      `${k.replace('_',' ')}: ${v.count}× / ${(v.sec/60).toFixed(0)}m`
+    ).join(' · ');
+    const rows = d.meetings.map(r => {
+      const t = r.start_time ? r.start_time.split('T')[1]?.slice(0,5) : '';
+      const mins = Math.round((r.duration_seconds||0)/60);
+      return `<tr><td>${t}</td><td>${mins}m</td><td><span class="src-${escapeHtml(r.source)}">${escapeHtml(r.source.replace('_',' '))}</span></td><td>${escapeHtml(r.title||'')}</td></tr>`;
+    }).join('');
+    html += section(`Detected Meetings (${d.meetings.length}, ${(totalSec/3600).toFixed(2)}h) — ${summary}`,
+      `<table class="m-tbl"><thead><tr><th>Time</th><th>Dur</th><th>Source</th><th>Title</th></tr></thead><tbody>${rows}</tbody></table>`);
+  }
+
+  // Calendar
+  if (d.calendar?.length) {
+    const totalMin = d.calendar.reduce((s,r)=>s+(r.duration_minutes||0),0);
+    const rows = d.calendar.map(r => {
+      const t = r.start_time ? r.start_time.split('T')[1]?.slice(0,5) : '';
+      return `<tr><td>${t}</td><td>${r.duration_minutes||''}m</td><td>${escapeHtml(r.summary)}</td><td>${r.is_meet?'✓':''}</td></tr>`;
+    }).join('');
+    html += section(`Calendar (${d.calendar.length} events, ${(totalMin/60).toFixed(2)}h)`,
+      `<table class="m-tbl"><thead><tr><th>Time</th><th>Dur</th><th>Summary</th><th>Meet</th></tr></thead><tbody>${rows}</tbody></table>`);
+  }
+
+  if (!html) html = '<p class="muted">No activity recorded for this day.</p>';
+  $('#modal-body').innerHTML = html;
+}
+
+document.querySelectorAll('.row-day').forEach(tr => {
+  tr.addEventListener('click', () => openDay(tr.dataset.date));
+});
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+$('#modal').addEventListener('click', e => { if (e.target === $('#modal')) closeModal(); });
+
+async function trigger() {
+  const start = document.querySelector('[name=start]').value;
+  const end = document.querySelector('[name=end]').value;
+  const r = await fetch(`/api/run?start=${start}&end=${end}`, {method:'POST'});
+  const j = await r.json();
+  alert('Done: ' + JSON.stringify(j));
+  location.reload();
+}
+</script>
+</body>
+</html>

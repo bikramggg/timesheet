@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Analytics</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Coding Time Summary <small><a href="/">← Back to timesheet</a></small></h1>
+</header>
+
+<form method="get" id="filters" class="filters">
+  <label>From <input type="date" name="start" value="{{ start }}"></label>
+  <label>To <input type="date" name="end" value="{{ end }}"></label>
+  <label>Project <select name="project"><option value="">All</option></select></label>
+  <label>Branch <select name="branch"><option value="">All</option></select></label>
+  <button>Apply</button>
+  <button type="reset" onclick="setTimeout(()=>location.href='/analytics',0)">Reset</button>
+</form>
+
+<h2>Developer Insights</h2>
+<section class="totals">
+  <div class="card big">
+    <h3>Most Productive Day</h3>
+    <span id="mp-day">—</span>
+    <small id="mp-avg" class="muted"></small>
+    <canvas id="mp-chart" height="60"></canvas>
+  </div>
+  <div class="card big">
+    <h3>Languages Used</h3>
+    <span id="lang-count">0</span>
+    <small id="lang-top" class="muted"></small>
+    <canvas id="lang-chart" height="100"></canvas>
+  </div>
+  <div class="card big">
+    <h3>Projects Worked</h3>
+    <span id="proj-count">0</span>
+    <small id="proj-top" class="muted"></small>
+    <canvas id="proj-mini-chart" height="60"></canvas>
+  </div>
+  <div class="card big">
+    <h3>Longest Streak</h3>
+    <span id="streak-longest">0</span><small> days</small>
+    <small id="streak-current" class="muted"></small>
+  </div>
+</section>
+
+<h2>Coding Time Analytics</h2>
+<section class="grid-2">
+  <div class="card">
+    <h3>Time Summary</h3>
+    <span id="ts-total">—</span>
+    <canvas id="ts-chart" height="120"></canvas>
+  </div>
+  <div class="card">
+    <h3>Daily Breakdown</h3>
+    <span id="da-total">—</span>
+    <canvas id="da-chart" height="120"></canvas>
+  </div>
+  <div class="card">
+    <h3>Weekly Progress</h3>
+    <span id="wk-total">—</span>
+    <canvas id="wk-chart" height="120"></canvas>
+  </div>
+  <div class="card">
+    <h3>Monthly Trend</h3>
+    <span id="mo-total">—</span>
+    <canvas id="mo-chart" height="120"></canvas>
+  </div>
+</section>
+
+<h2>Coding Activity</h2>
+<section class="card heatmap-section">
+  <div id="heatmap"></div>
+  <div class="heatmap-legend">
+    <span>Less</span>
+    <span class="hm-cell hm-0"></span>
+    <span class="hm-cell hm-1"></span>
+    <span class="hm-cell hm-2"></span>
+    <span class="hm-cell hm-3"></span>
+    <span class="hm-cell hm-4"></span>
+    <span>More</span>
+  </div>
+</section>
+
+<h2>Project & Daily</h2>
+<section class="card"><h3>Project Summary (Top 5)</h3><canvas id="proj-top-chart" height="120"></canvas></section>
+<section class="card"><h3>Daily Summary</h3><canvas id="daily-line-chart" height="120"></canvas></section>
+<section class="card"><h3>Project Distribution</h3><canvas id="proj-pie-chart" height="160"></canvas></section>
+<section class="card"><h3>Language Distribution</h3><canvas id="lang-pie-chart" height="160"></canvas></section>
+
+<script>
+Chart.defaults.color = '#e6e1cf';
+Chart.defaults.borderColor = 'rgba(255,255,255,0.05)';
+Chart.defaults.font.family = '-apple-system, "SF Mono", monospace';
+const ACCENT = '#ffb454';
+const PALETTE = ['#ffb454','#7fd962','#5ccfe6','#cda1ff','#ff7733','#73d0ff','#f29e74','#bae67e','#ff8f40','#fa8d3e','#a37acc','#e6c074'];
+
+const fmtH = m => `${(m/60).toFixed(2)}h`;
+const fmtHM = m => { m = Math.round(m); const h = Math.floor(m/60); const mm = m%60; return `${h}h ${mm}m`; };
+
+function qsParams(){
+  const f = document.getElementById('filters');
+  const p = new URLSearchParams();
+  ['start','end','project','branch'].forEach(k => {
+    const v = f.elements[k]?.value;
+    if (v) p.set(k, v);
+  });
+  return p;
+}
+
+async function fetchJson(path){
+  const p = qsParams();
+  const r = await fetch(path + (path.includes('?')?'&':'?') + p.toString());
+  return r.json();
+}
+
+let charts = {};
+function chart(id, cfg){
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), cfg);
+  return charts[id];
+}
+
+async function loadInsights(){
+  const d = await fetchJson('/api/charts/insights');
+  document.getElementById('mp-day').textContent = d.most_productive ? d.most_productive.name : '—';
+  document.getElementById('mp-avg').textContent = d.most_productive ? `Avg ${fmtHM(d.most_productive.avg_minutes)}` : '';
+  document.getElementById('lang-count').textContent = d.language_count;
+  document.getElementById('lang-top').textContent = d.top_language ? `Most used: ${d.top_language.language || 'unknown'} (${d.top_language.pct}%)` : '';
+  document.getElementById('proj-count').textContent = d.project_count;
+  document.getElementById('proj-top').textContent = d.top_project ? `Most active: ${d.top_project.project} (${d.top_project.pct}%)` : '';
+  document.getElementById('streak-longest').textContent = d.longest_streak;
+  document.getElementById('streak-current').textContent = `Current: ${d.current_streak} days 🔥`;
+
+  // Most-productive bar chart (avg minutes per weekday)
+  const bestIdx = d.weekday_avg.findIndex(w => d.most_productive && w.name === d.most_productive.name);
+  chart('mp-chart', {
+    type: 'bar',
+    data: {
+      labels: d.weekday_avg.map(w=>w.name[0]),
+      datasets: [{
+        data: d.weekday_avg.map(w=>w.avg_minutes),
+        backgroundColor: d.weekday_avg.map((_,i)=> i===bestIdx ? '#ff7733' : '#5ccfe6'),
+        borderRadius: 3,
+      }]
+    },
+    options: {plugins:{legend:{display:false}}, scales:{x:{display:false},y:{display:false}}, maintainAspectRatio:false}
+  });
+
+  // Languages donut
+  chart('lang-chart', {
+    type: 'doughnut',
+    data: {
+      labels: d.languages.slice(0,8).map(l=>l.language||'unknown'),
+      datasets: [{ data: d.languages.slice(0,8).map(l=>l.minutes), backgroundColor: PALETTE }]
+    },
+    options: {plugins:{legend:{display:false}}, maintainAspectRatio:false}
+  });
+
+  // Projects mini bar
+  chart('proj-mini-chart', {
+    type: 'bar',
+    data: {
+      labels: d.projects.slice(0,5).map(p=>p.project),
+      datasets: [{ data: d.projects.slice(0,5).map(p=>p.minutes), backgroundColor: ACCENT, borderRadius:3 }]
+    },
+    options: {plugins:{legend:{display:false}}, scales:{x:{display:false},y:{display:false}}, maintainAspectRatio:false}
+  });
+
+  // Top 5 horizontal bar chart
+  chart('proj-top-chart', {
+    type: 'bar',
+    data: {
+      labels: d.projects.slice(0,5).map(p=>p.project),
+      datasets: [{label:'Minutes', data: d.projects.slice(0,5).map(p=>p.minutes), backgroundColor: ACCENT}]
+    },
+    options: {indexAxis:'y', plugins:{legend:{display:false}}, maintainAspectRatio:false,
+      scales:{x:{ticks:{callback:v=>fmtH(v)}}}}
+  });
+
+  // Project pie
+  chart('proj-pie-chart', {
+    type: 'pie',
+    data: {
+      labels: d.projects.map(p=>`${p.project}: ${fmtHM(p.minutes)}`),
+      datasets: [{ data: d.projects.map(p=>p.minutes), backgroundColor: PALETTE }]
+    },
+    options: {plugins:{legend:{position:'right'}}, maintainAspectRatio:false}
+  });
+
+  // Language pie
+  chart('lang-pie-chart', {
+    type: 'pie',
+    data: {
+      labels: d.languages.map(l=>`${l.language||'unknown'}: ${fmtHM(l.minutes)}`),
+      datasets: [{ data: d.languages.map(l=>l.minutes), backgroundColor: PALETTE }]
+    },
+    options: {plugins:{legend:{position:'right'}}, maintainAspectRatio:false}
+  });
+}
+
+async function loadTimeSummary(){
+  const d = await fetchJson('/api/charts/time_summary');
+  document.getElementById('ts-total').textContent = fmtHM(d.all_time);
+  chart('ts-chart', {
+    type: 'bar',
+    data: {
+      labels: ['Today','Week','Month','Year','All'],
+      datasets: [{ data: [d.today, d.this_week, d.this_month, d.this_year, d.all_time], backgroundColor: '#e6c074' }]
+    },
+    options: {indexAxis:'y', plugins:{legend:{display:false},
+      tooltip:{callbacks:{label:c=>fmtHM(c.parsed.x)}}},
+      maintainAspectRatio:false, scales:{x:{ticks:{callback:v=>fmtH(v)}}}}
+  });
+}
+
+async function loadDaily(){
+  const d = await fetchJson('/api/charts/daily');
+  const total = d.reduce((s,r)=>s+r.minutes,0);
+  document.getElementById('da-total').textContent = `Avg ${fmtHM(d.length?total/d.length:0)}`;
+  chart('da-chart', {
+    type: 'bar',
+    data: {
+      labels: d.map(r=>r.date.slice(5)),
+      datasets: [{ data: d.map(r=>r.minutes), backgroundColor: ACCENT }]
+    },
+    options: {plugins:{legend:{display:false},
+      tooltip:{callbacks:{label:c=>fmtHM(c.parsed.y)}}},
+      maintainAspectRatio:false, scales:{y:{ticks:{callback:v=>fmtH(v)}}}}
+  });
+  // Daily line chart (separate)
+  chart('daily-line-chart', {
+    type: 'line',
+    data: {
+      labels: d.map(r=>r.date),
+      datasets: [{label:'Coding Time', data: d.map(r=>r.minutes/60),
+        borderColor: ACCENT, backgroundColor: 'rgba(255,180,84,0.15)', fill:true, tension:0.3, pointRadius:2}]
+    },
+    options: {maintainAspectRatio:false,
+      plugins:{tooltip:{callbacks:{label:c=>fmtHM(c.parsed.y*60)}}},
+      scales:{y:{ticks:{callback:v=>v+'h'}}}}
+  });
+}
+
+async function loadWeekly(){
+  const d = await fetchJson('/api/charts/weekly');
+  const total = d.reduce((s,r)=>s+r.minutes,0);
+  document.getElementById('wk-total').textContent = fmtHM(d.length?total/d.length:0) + '/wk';
+  chart('wk-chart', {
+    type: 'line',
+    data: {
+      labels: d.map(r=>r.week),
+      datasets: [{ data: d.map(r=>r.minutes/60), borderColor:'#5ccfe6',
+        backgroundColor:'rgba(92,207,230,0.15)', fill:true, tension:0.3, pointRadius:2 }]
+    },
+    options: {plugins:{legend:{display:false},
+      tooltip:{callbacks:{label:c=>fmtHM(c.parsed.y*60)}}},
+      maintainAspectRatio:false, scales:{y:{ticks:{callback:v=>v+'h'}}}}
+  });
+}
+
+async function loadMonthly(){
+  const d = await fetchJson('/api/charts/monthly');
+  const total = d.reduce((s,r)=>s+r.minutes,0);
+  document.getElementById('mo-total').textContent = fmtHM(d.length?total/d.length:0) + '/mo';
+  chart('mo-chart', {
+    type: 'line',
+    data: {
+      labels: d.map(r=>r.ym),
+      datasets: [{ data: d.map(r=>r.minutes/60), borderColor:'#ff7799',
+        backgroundColor:'rgba(255,119,153,0.15)', fill:true, tension:0.4, pointRadius:3 }]
+    },
+    options: {plugins:{legend:{display:false},
+      tooltip:{callbacks:{label:c=>fmtHM(c.parsed.y*60)}}},
+      maintainAspectRatio:false, scales:{y:{ticks:{callback:v=>v+'h'}}}}
+  });
+}
+
+async function loadHeatmap(){
+  const d = await fetchJson('/api/charts/heatmap?months=3');
+  const root = document.getElementById('heatmap');
+  root.innerHTML = '';
+  // Group days by month, render each as a 7-row x N-col grid (rows = day-of-week)
+  const minutesArr = d.days.map(x=>x.minutes).filter(m=>m>0);
+  const maxM = Math.max(60, ...minutesArr);
+  const bucket = m => m === 0 ? 0 : Math.min(4, Math.ceil((m / maxM) * 4));
+
+  const byMonth = {};
+  d.days.forEach(x => { const k = x.date.slice(0,7); (byMonth[k]=byMonth[k]||[]).push(x); });
+
+  const wrap = document.createElement('div'); wrap.className = 'hm-row';
+  for (const [month, days] of Object.entries(byMonth)) {
+    const block = document.createElement('div'); block.className = 'hm-month';
+    const title = document.createElement('h4'); title.textContent = new Date(month + '-01').toLocaleDateString('en-US',{month:'long',year:'numeric'});
+    block.appendChild(title);
+    const grid = document.createElement('div'); grid.className = 'hm-grid';
+    // Pad start to align first day of month to its weekday column
+    const firstDow = new Date(days[0].date).getDay(); // 0=Sun
+    for (let i=0; i<firstDow; i++) {
+      const empty = document.createElement('div'); empty.className = 'hm-cell hm-empty'; grid.appendChild(empty);
+    }
+    days.forEach(x => {
+      const c = document.createElement('div');
+      c.className = 'hm-cell hm-' + bucket(x.minutes);
+      c.title = `${x.date}: ${fmtHM(x.minutes)}`;
+      grid.appendChild(c);
+    });
+    block.appendChild(grid);
+    wrap.appendChild(block);
+  }
+  root.appendChild(wrap);
+}
+
+async function loadProjectsList(){
+  const projs = await fetch('/api/charts/projects_list').then(r=>r.json());
+  const sel = document.querySelector('select[name=project]');
+  const cur = '{{ project }}';
+  projs.forEach(p => {
+    const o = document.createElement('option');
+    o.value = p; o.textContent = p;
+    if (p === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+async function loadBranches(){
+  const project = document.querySelector('select[name=project]').value;
+  const start = document.querySelector('[name=start]').value;
+  const end = document.querySelector('[name=end]').value;
+  const url = `/api/charts/branches?start=${start}&end=${end}` + (project?`&project=${encodeURIComponent(project)}`:'');
+  const rows = await fetch(url).then(r=>r.json());
+  const sel = document.querySelector('select[name=branch]');
+  const cur = '{{ branch }}';
+  // Reset
+  sel.innerHTML = '<option value="">All</option>';
+  const seen = new Set();
+  rows.forEach(r => {
+    if (seen.has(r.branch)) return; seen.add(r.branch);
+    const o = document.createElement('option');
+    o.value = r.branch; o.textContent = r.branch || '(none)';
+    if (r.branch === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+async function loadAll(){
+  await loadProjectsList();
+  await loadBranches();
+  await Promise.all([loadInsights(), loadTimeSummary(), loadDaily(), loadWeekly(), loadMonthly(), loadHeatmap()]);
+}
+
+document.querySelector('select[name=project]').addEventListener('change', loadBranches);
+loadAll();
+</script>
+</body>
+</html>
