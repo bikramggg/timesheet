@@ -468,9 +468,12 @@ def worklog_plan(date: str, target_hours: float = 8.0, day_start: str = "10:00",
             else:
                 vs_unmatched += r["m"] or 0
 
-        # Jira activity today
+        # Jira activity today — also exclude volatile field-edits at query time as a safety net
         jira_rows = c.execute(
-            "SELECT issue_key, summary, status, project, action, detail FROM jira_activity WHERE date=?",
+            "SELECT issue_key, summary, status, project, action, detail FROM jira_activity WHERE date=? "
+            "AND action NOT IN ('edit_field:timeestimate','edit_field:timespent','edit_field:WorklogId',"
+            "'edit_field:Worklog Id','edit_field:WorklogTimeSpent','edit_field:Comment Id',"
+            "'edit_field:Workflow','edit_field:RemoteIssueLink','edit_field:Link')",
             (date,)
         ).fetchall()
         jira_by_key = {}

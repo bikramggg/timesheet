@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Daily: collect today's data, then log worklogs to HnR.
-set -euo pipefail
+set -uo pipefail  # don't exit on errors, log them instead
 
 cd "$(dirname "$0")/.."
 set -a; . .env; set +a

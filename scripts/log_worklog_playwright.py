@@ -201,16 +201,29 @@ async def replay_mode(plan, headless=False):
             "accept": "application/graphql-response+json, application/json",
         },
     ) as cli:
-        ok_count = fail_count = 0
+        ok_count = fail_count = skip_count = 0
         for e in plan_to_send:
+            already = e.get("already_logged_minutes") or 0
+            net = max(0, int(e["minutes"]) - int(already))
+            if net < 1:
+                skip_count += 1
+                print(f"  {e['taskKey']:<12} {e['minutes']:>4}m  SKIP (already logged {already}m)")
+                continue
+            # Adjust endTime if we shrank duration due to existing log
+            new_end = e["endTime"]
+            if net != int(e["minutes"]):
+                from datetime import datetime as _dt, timedelta as _td
+                st = _dt.strptime(e["startTime"], "%H:%M")
+                new_end = (st + _td(minutes=net)).strftime("%H:%M")
+
             body = json.loads(json.dumps(template["body_template"]))
             body["variables"]["input"]["payload"]["call"]["payload"] = {
                 "taskKey": e["taskKey"],
-                "minutes": int(e["minutes"]),
-                "notes": e["notes"],
+                "minutes": net,
+                "notes": e["notes"] + (f" (delta from {e['minutes']}m, already {already}m)" if net != e["minutes"] else ""),
                 "entryDate": e["entryDate"],
                 "startTime": e["startTime"],
-                "endTime": e["endTime"],
+                "endTime": new_end,
             }
             r = await cli.post(template["url"], json=body)
             ok = False; reason = ""
@@ -225,7 +238,7 @@ async def replay_mode(plan, headless=False):
                 reason = r.text[:140]
             ok_count += int(ok); fail_count += int(not ok)
             print(f"  {e['taskKey']:<12} {e['minutes']:>4}m {e['startTime']}-{e['endTime']}  -> {r.status_code}  {'OK' if ok else 'FAIL: '+reason}")
-        print(f"[replay] done: {ok_count} OK, {fail_count} FAIL")
+        print(f"[replay] done: {ok_count} OK, {fail_count} FAIL, {skip_count} SKIP")
 
 
 async def ui_mode(plan, headless=False):

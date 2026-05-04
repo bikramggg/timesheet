@@ -77,13 +77,17 @@ def collect(start_date, end_date):
             if d and start_date <= d <= end_date:
                 rows.append((d, key, summary, status, project, "worklog", str(w.get("timeSpentSeconds",0))))
 
-        # Changelog by me
+        # Changelog by me — skip volatile fields that are side-effects of worklog/comment ops
+        VOLATILE_FIELDS = {"timeestimate", "timespent", "WorklogId", "Worklog Id",
+                           "WorklogTimeSpent", "Comment Id", "Workflow",
+                           "RemoteIssueLink", "Link"}
         for h in (n.get("changelog") or {}).get("histories", []):
             if (h.get("author") or {}).get("accountId") != ME: continue
             d = to_ist_date(h.get("created"))
             if not d or not (start_date <= d <= end_date): continue
             for it in h.get("items", []):
                 field = it.get("field")
+                if field in VOLATILE_FIELDS: continue
                 if field == "status":
                     detail = f"{it.get('fromString','')}->{it.get('toString','')}"
                     rows.append((d, key, summary, status, project, "transition", detail))
