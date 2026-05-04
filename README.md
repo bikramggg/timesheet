@@ -118,6 +118,21 @@ sudo pmset repeat wakeorpoweron MTWRFSU 23:45:00
 | `GCAL_ICS_URL` | Google Calendar → Settings → your calendar → "Integrate calendar" → "Secret address in iCal format" |
 | `NTFY_URL` / `NTFY_TOPIC` | self-hosted ntfy server, or https://ntfy.sh |
 
+## Worklog automation
+
+Some teams use in-house Jira Forge apps for time tracking instead of native Jira worklogs. This repo includes:
+
+- `GET /api/worklog/plan?date=YYYY-MM-DD&target_hours=8` — generates a worklog plan for one day
+  - VSCode branch matches an issue key (`TF-1234`) → minutes proportional to coded time
+  - Jira-touched issues with no VSCode time → flat 10min each
+  - Sequential time slots starting 10:00, no overlap
+  - Output shape matches typical Forge app payloads: `{taskKey, minutes, notes, entryDate, startTime, endTime}`
+- `GET /api/worklog/plan_range?start=&end=` — same, batched for a date range, weekends skipped
+- [`scripts/log_worklog_playwright.py`](scripts/log_worklog_playwright.py) — deterministic Playwright automation. Two modes:
+  - `--mode=ui` drives the form UI (adjust selectors for your app)
+  - `--mode=replay` captures one real submission, extracts GraphQL endpoint + auth tokens, replays remaining entries directly (much faster)
+- [`scripts/log_worklog_browseruse.py`](scripts/log_worklog_browseruse.py) — LLM-driven via [browser-use](https://github.com/browser-use/browser-use). Slower but more resilient to UI changes.
+
 ## Schema
 
 SQLite tables: `days`, `vscode_entries`, `activitywatch_daily`, `jira_activity`, `github_events`, `calendar_events`, `meeting_sessions`, `daily_summary`, `run_log`.

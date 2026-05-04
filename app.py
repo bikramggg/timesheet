@@ -395,3 +395,178 @@ def projects_list():
             "SELECT DISTINCT project FROM vscode_entries WHERE project!='' ORDER BY project"
         ).fetchall()]
     return rows
+
+
+# ---------- Worklog plan (HnR Forge app payload shape) ----------
+
+import re
+ISSUE_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+def _add_minutes(hhmm: str, minutes: int) -> str:
+    h, m = map(int, hhmm.split(":"))
+    total = h * 60 + m + minutes
+    return f"{(total // 60) % 24:02d}:{total % 60:02d}"
+
+
+@app.get("/api/worklog/plan")
+def worklog_plan(date: str, target_hours: float = 8.0, day_start: str = "10:00",
+                 jira_only_minutes: int = 10, skip_zero: bool = True):
+    """
+    Plan worklog entries for one day. Output shape matches HnR Forge app's createEntry payload:
+        {taskKey, minutes, notes, entryDate, startTime, endTime}
+
+    Allocation:
+      1. VSCode branches matching an issue key (e.g. TF-1234) → minutes proportional to coded time
+      2. Jira-touched issues with no VSCode time → flat `jira_only_minutes` each
+      3. Total scaled so coding time fills (target_hours - meeting_minutes)
+      4. Sequential time slots starting at `day_start`, no overlap
+    """
+    with conn() as c:
+        # VSCode minutes per branch
+        vs_rows = c.execute(
+            "SELECT branch, project, ROUND(SUM(minutes),2) m FROM vscode_entries WHERE date=? AND branch != '' GROUP BY branch, project",
+            (date,)
+        ).fetchall()
+        vs_by_issue = {}
+        vs_unmatched = 0.0
+        for r in vs_rows:
+            mobj = ISSUE_RE.search(r["branch"] or "")
+            if mobj:
+                k = mobj.group(1)
+                e = vs_by_issue.setdefault(k, {"minutes": 0.0, "branches": set(), "projects": set()})
+                e["minutes"] += r["m"] or 0
+                e["branches"].add(r["branch"])
+                e["projects"].add(r["project"])
+            else:
+                vs_unmatched += r["m"] or 0
+
+        # Jira activity today
+        jira_rows = c.execute(
+            "SELECT issue_key, summary, status, project, action, detail FROM jira_activity WHERE date=?",
+            (date,)
+        ).fetchall()
+        jira_by_key = {}
+        for r in jira_rows:
+            j = jira_by_key.setdefault(r["issue_key"], {
+                "summary": r["summary"], "status": r["status"], "project": r["project"],
+                "actions": []
+            })
+            j["actions"].append({"action": r["action"], "detail": r["detail"]})
+
+        # Already-logged worklogs (by me) for the day, to surface delta
+        existing = {}
+        for r in c.execute(
+            "SELECT issue_key, SUM(CAST(detail AS INTEGER)) sec FROM jira_activity WHERE date=? AND action='worklog' GROUP BY issue_key",
+            (date,)
+        ).fetchall():
+            existing[r["issue_key"]] = round((r["sec"] or 0) / 60)
+
+        aw_row = c.execute("SELECT active_seconds FROM activitywatch_daily WHERE date=?", (date,)).fetchone()
+        aw_min = round((aw_row[0] or 0) / 60) if aw_row else 0
+
+        meet_min = round(c.execute(
+            "SELECT COALESCE(SUM(duration_seconds),0)/60.0 FROM meeting_sessions WHERE date=?", (date,)
+        ).fetchone()[0])
+
+    # Allocation
+    target_min = int(round(target_hours * 60))
+    coding_pool = max(target_min - meet_min, 0)
+
+    jira_only_keys = [k for k in jira_by_key if k not in vs_by_issue]
+    jira_only_alloc = min(len(jira_only_keys) * jira_only_minutes, int(coding_pool * 0.25))
+    coding_for_vs = max(coding_pool - jira_only_alloc, 0)
+
+    total_vs = sum(v["minutes"] for v in vs_by_issue.values())
+
+    raw_entries = []  # before scaling, for reference
+
+    if total_vs > 0 and coding_for_vs > 0:
+        scale = coding_for_vs / total_vs
+        for k, v in vs_by_issue.items():
+            mins = int(round(v["minutes"] * scale))
+            if mins < 1: continue
+            actions = jira_by_key.get(k, {}).get("actions", [])
+            note_parts = [f"Coding on {', '.join(sorted(v['branches']))}"]
+            if actions:
+                act_strs = [f"{a['action']}{':'+a['detail'] if a['detail'] else ''}" for a in actions[:5]]
+                note_parts.append("Activity: " + ", ".join(act_strs))
+            raw_entries.append({
+                "taskKey": k,
+                "minutes": mins,
+                "notes": ". ".join(note_parts),
+                "entryDate": date,
+                "_source": "vscode+jira" if k in jira_by_key else "vscode_only",
+                "_summary": jira_by_key.get(k, {}).get("summary", ""),
+                "_already_logged_minutes": existing.get(k, 0),
+                "_vscode_minutes": round(v["minutes"], 1),
+            })
+
+    if jira_only_keys and jira_only_alloc > 0:
+        per = max(jira_only_minutes, jira_only_alloc // len(jira_only_keys))
+        for k in jira_only_keys:
+            j = jira_by_key[k]
+            act_strs = [f"{a['action']}{':'+a['detail'] if a['detail'] else ''}" for a in j["actions"][:5]]
+            raw_entries.append({
+                "taskKey": k,
+                "minutes": per,
+                "notes": "Activity: " + ", ".join(act_strs),
+                "entryDate": date,
+                "_source": "jira_only",
+                "_summary": j["summary"],
+                "_already_logged_minutes": existing.get(k, 0),
+                "_vscode_minutes": 0,
+            })
+
+    # Sort by largest first so big slots come early in day
+    raw_entries.sort(key=lambda x: -x["minutes"])
+
+    # Sequential time slots starting at day_start
+    cursor = day_start
+    plan = []
+    for e in raw_entries:
+        if skip_zero and e["minutes"] < 1:
+            continue
+        start = cursor
+        end = _add_minutes(start, e["minutes"])
+        plan.append({
+            "taskKey": e["taskKey"],
+            "minutes": e["minutes"],
+            "notes": e["notes"],
+            "entryDate": e["entryDate"],
+            "startTime": start,
+            "endTime": end,
+            # extra context for the UI/automation
+            "summary": e["_summary"],
+            "source": e["_source"],
+            "already_logged_minutes": e["_already_logged_minutes"],
+            "vscode_minutes": e["_vscode_minutes"],
+        })
+        cursor = end
+
+    return {
+        "date": date,
+        "target_hours": target_hours,
+        "active_aw_minutes": aw_min,
+        "meeting_minutes": meet_min,
+        "vscode_minutes_total": round(total_vs),
+        "vscode_unmatched_minutes": round(vs_unmatched),
+        "jira_only_issue_count": len(jira_only_keys),
+        "plan": plan,
+        "plan_total_minutes": sum(p["minutes"] for p in plan),
+        "plan_total_hours": round(sum(p["minutes"] for p in plan) / 60, 2),
+    }
+
+
+@app.get("/api/worklog/plan_range")
+def worklog_plan_range(start: str, end: str, target_hours: float = 8.0,
+                       day_start: str = "10:00", skip_weekends: bool = True):
+    """Plan a date range. Skips weekends by default."""
+    s = date.fromisoformat(start); e = date.fromisoformat(end)
+    out = []
+    d = s
+    while d <= e:
+        if skip_weekends and d.weekday() >= 5:
+            d += timedelta(days=1); continue
+        out.append(worklog_plan(d.isoformat(), target_hours, day_start))
+        d += timedelta(days=1)
+    return out
