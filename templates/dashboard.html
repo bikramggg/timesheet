@@ -196,10 +196,22 @@ $('#modal').addEventListener('click', e => { if (e.target === $('#modal')) close
 async function trigger() {
   const start = document.querySelector('[name=start]').value;
   const end = document.querySelector('[name=end]').value;
-  const r = await fetch(`/api/run?start=${start}&end=${end}`, {method:'POST'});
-  const j = await r.json();
-  alert('Done: ' + JSON.stringify(j));
-  location.reload();
+  const btns = document.querySelectorAll('header button');
+  btns.forEach(b => b.disabled = true);
+  const orig = event.target.textContent;
+  event.target.textContent = 'Syncing Mac…';
+  try {
+    const r = await fetch(`/api/run?start=${start}&end=${end}&sync_mac=true`, {method:'POST'});
+    const j = await r.json();
+    const macStatus = j.mac_push?.ok ? 'Mac sync OK' : (j.mac_push?.skipped || j.mac_push?.error || 'Mac sync skipped');
+    alert(`Done.\n${macStatus}\nCollector: ${j.status}`);
+  } catch (e) {
+    alert('Error: ' + e);
+  } finally {
+    btns.forEach(b => b.disabled = false);
+    event.target.textContent = orig;
+    location.reload();
+  }
 }
 </script>
 </body>

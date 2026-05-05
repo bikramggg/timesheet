@@ -169,11 +169,37 @@ def api_day(d: str):
     return JSONResponse(fetch_day_detail(d))
 
 @app.post("/api/run")
-def api_run(start: str = None, end: str = None):
-    """Trigger a collection run on demand."""
+def api_run(start: str = None, end: str = None, sync_mac: bool = True):
+    """Trigger a collection run on demand. By default first asks Mac to push fresh local data."""
+    mac_result = None
+    if sync_mac:
+        mac_result = trigger_mac_push()
     from collectors.run_all import main as run_main
     run_main(start, end)
-    return {"status": "ok"}
+    return {"status": "ok", "mac_push": mac_result}
+
+
+def trigger_mac_push():
+    """Hit the Mac webhook to fetch fresh ActivityWatch + VSCode tracker data."""
+    url = os.environ.get("MAC_PUSH_URL")
+    token = os.environ.get("MAC_PUSH_TOKEN", "")
+    if not url:
+        return {"skipped": "MAC_PUSH_URL not set"}
+    import httpx
+    try:
+        r = httpx.post(url.rstrip("/") + "/push",
+                       headers={"x-token": token} if token else {},
+                       timeout=120)
+        ok = r.status_code == 200
+        return {"status": r.status_code, "ok": ok, "body": r.text[-500:] if not ok else "ok"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/sync_mac")
+def api_sync_mac():
+    """Force Mac to push without running collectors."""
+    return trigger_mac_push()
 
 @app.get("/api/health")
 def health():
